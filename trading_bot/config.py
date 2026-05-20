@@ -42,6 +42,14 @@ class Config:
     EXCHANGE_NAME: str = "bybit"
     EXCHANGE_PRIORITY: str = "gateio,binance,bybit"
 
+    # NPM — News Processing Module
+    NPM_MODEL_NAME: str = "ProsusAI/finbert"
+    NPM_LAMBDA_DECAY: float = 0.1
+
+    # TSM — Time Series Module (LSTM)
+    TSM_MODEL_PATH: str = ""  # путь к файлу весов .pth; пустая строка = режим нейтрального скора
+    TSM_WINDOW: int = 60
+
 
 def _load_env_file() -> Dict[str, str]:
     """
@@ -118,6 +126,10 @@ def get_config() -> Config:
         LOG_LEVEL=_get("LOG_LEVEL", "INFO"),
         EXCHANGE_NAME=_get("EXCHANGE_NAME", "bybit"),
         EXCHANGE_PRIORITY=_get("EXCHANGE_PRIORITY", "gateio,bybit,binance"),
+        NPM_MODEL_NAME=_get("NPM_MODEL_NAME", "ProsusAI/finbert"),
+        NPM_LAMBDA_DECAY=float(_get("NPM_LAMBDA_DECAY", "0.1")),
+        TSM_MODEL_PATH=_get("TSM_MODEL_PATH", ""),
+        TSM_WINDOW=int(_get("TSM_WINDOW", "60")),
     )
 
 

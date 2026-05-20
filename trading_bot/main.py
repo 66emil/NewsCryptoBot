@@ -1,12 +1,17 @@
 import asyncio
 import logging
+import time
 from typing import Any, Dict
 
+import numpy as np
 from pyrogram.types import Message
 
-from trading_bot.analysis.keyword_analyzer import analyze_news
-from trading_bot.analysis.tech_indicators import calculate_indicators
-from trading_bot.analysis.decision_engine import make_decision
+from trading_bot.analysis.keyword_analyzer import extract_ticker
+from trading_bot.analysis.npm import NewsProcessingModule
+from trading_bot.analysis.tam import TechnicalAnalysisModule
+from trading_bot.analysis.tsm import TimeSeriesModule
+from trading_bot.analysis.sgs import aggregate as sgs_aggregate
+from trading_bot.analysis.fds import detect_flat
 from trading_bot.bybit import orders
 from trading_bot.config import get_config
 from trading_bot.storage.storage import save_news
@@ -14,138 +19,172 @@ from trading_bot.telegram.client import create_telegram_client, setup_news_handl
 from trading_bot.exchange.router import route_symbol
 from trading_bot.exchange.factory import get_exchange
 
-
 logger = logging.getLogger(__name__)
 
+# Module singletons — initialised lazily on first message
+_npm: NewsProcessingModule | None = None
+_tam: TechnicalAnalysisModule | None = None
+_tsm: TimeSeriesModule | None = None
+
+
+def _get_npm() -> NewsProcessingModule:
+    global _npm
+    if _npm is None:
+        cfg = get_config()
+        _npm = NewsProcessingModule(
+            model_name=cfg.NPM_MODEL_NAME,
+            lambda_decay=cfg.NPM_LAMBDA_DECAY,
+        )
+    return _npm
+
+
+def _get_tam() -> TechnicalAnalysisModule:
+    global _tam
+    if _tam is None:
+        _tam = TechnicalAnalysisModule()
+    return _tam
+
+
+def _get_tsm() -> TimeSeriesModule:
+    global _tsm
+    if _tsm is None:
+        cfg = get_config()
+        _tsm = TimeSeriesModule(
+            model_path=cfg.TSM_MODEL_PATH,
+            window=cfg.TSM_WINDOW,
+        )
+    return _tsm
+
+
+# ---------------------------------------------------------------------------
+# Position monitor (unchanged logic)
+# ---------------------------------------------------------------------------
 
 async def monitor_positions() -> None:
-    """
-    Фоновая задача: проверка открытых позиций каждые 60 секунд.
-    Если позиция открыта более 15 минут, она закрывается принудительно.
-    """
     logger.info("Запущен мониторинг позиций (таймер 15 минут)")
     exchange = get_exchange()
-    
+
     while True:
         try:
-            # Ждем минуту перед следующей проверкой
             await asyncio.sleep(60)
-            
+
             positions = await exchange.get_positions()
             if not positions:
                 continue
-                
-            import time
+
             now_ts = int(time.time() * 1000)
-            
             for pos in positions:
-                # Время создания/обновления позиции в мс
-                # Bybit: createdTime или updatedTime
                 created_time = pos.get("createdTime") or pos.get("updatedTime")
                 if not created_time:
                     continue
-                    
-                start_ts = int(created_time)
-                duration_min = (now_ts - start_ts) / 1000 / 60
-                
+
+                duration_min = (now_ts - int(created_time)) / 1000 / 60
                 symbol = pos.get("symbol")
                 side = pos.get("side")
-                
+
                 if duration_min > 15:
                     logger.info(
-                        "Позиция %s (%s) открыта %.1f минут (> 15 мин). Принудительное закрытие...",
-                        symbol, side, duration_min
+                        "Позиция %s (%s) открыта %.1f мин > 15. Принудительное закрытие…",
+                        symbol, side, duration_min,
                     )
                     res = await exchange.close_position(symbol, side)
                     logger.info("Результат закрытия %s: %s", symbol, res)
-                    
+
         except asyncio.CancelledError:
             logger.info("Мониторинг позиций остановлен")
             break
-        except Exception as e:
-            logger.error("Ошибка в мониторинге позиций: %s", e, exc_info=True)
+        except Exception as exc:
+            logger.error("Ошибка в мониторинге позиций: %s", exc, exc_info=True)
             await asyncio.sleep(60)
 
 
+# ---------------------------------------------------------------------------
+# Main news processing pipeline
+# ---------------------------------------------------------------------------
+
 async def process_news_message(message: Message) -> None:
-    """
-    Полный пайплайн обработки входящей новости из Telegram.
-    """
-    config = get_config()
+    cfg = get_config()
     text = message.text or message.caption or ""
+    msg_ts = time.time()
 
-    # 1. Анализ новости
-    news_data = await analyze_news(text)
-    raw_ticker = news_data.get("ticker")
-
-    # Если удалось вытащить тикер из новости – торгуем именно этим коином.
-    # Простое правило: если нет суффикса, добавляем USDT (PEOPLE -> PEOPLEUSDT).
+    # ── 1. Ticker extraction ──────────────────────────────────────────────
+    raw_ticker = await extract_ticker(text)
     if raw_ticker:
-        rt = str(raw_ticker).upper()
-        if rt.endswith("USDT") or rt.endswith("USDC"):
-            symbol = rt
-        else:
-            symbol = f"{rt}USDT"
+        rt = raw_ticker.upper()
+        symbol = rt if rt.endswith(("USDT", "USDC")) else f"{rt}USDT"
     else:
-        symbol = config.DEFAULT_SYMBOL
-        logger.info(
-            "Тикер в новости не распознан или не подходит под формат, "
-            "используем тикер по умолчанию %s",
-            symbol,
-        )
+        symbol = cfg.DEFAULT_SYMBOL
+        logger.info("Тикер не распознан, используем символ по умолчанию %s", symbol)
 
-    news_data["raw_ticker"] = raw_ticker
-    news_data["resolved_symbol"] = symbol
+    # ── 2. Persist news ───────────────────────────────────────────────────
+    await save_news({
+        "text": text,
+        "chat_id": message.chat.id,
+        "message_id": message.id,
+        "ticker": raw_ticker,
+        "symbol": symbol,
+        "timestamp": msg_ts,
+    })
 
-    # 2. Сохранение новости
-    await save_news(
-        {
-            "text": text,
-            "chat_id": message.chat.id,
-            "message_id": message.id,
-            **news_data,
-        }
-    )
-
-    # 3. Выбор биржи через роутер
+    # ── 3. Exchange routing ───────────────────────────────────────────────
     exchange = await route_symbol(symbol)
     if exchange is None:
-        logger.info(
-            "Тикер %s не найден ни на одной поддерживаемой бирже, торговый сигнал пропускается",
-            symbol,
-        )
+        logger.info("Тикер %s не найден ни на одной бирже — пропускаем", symbol)
         return
 
-    # 4. Технические индикаторы (на выбранной бирже)
-    technical_data = await calculate_indicators(symbol, exchange=exchange)
+    # ── 4. Fetch candles ──────────────────────────────────────────────────
+    klines = await exchange.get_klines(symbol, "1", limit=cfg.MAX_CANDLES)
+    if not klines:
+        logger.warning("Нет свечей для %s — пропускаем", symbol)
+        return
 
-    # 5. Комбинированное решение
-    decision = await make_decision(news_data, technical_data)
-    signal = decision["signal"]
+    # ── 5. TAM — Technical Analysis Module ───────────────────────────────
+    tam_result = await _get_tam().analyze(klines)
+    s_tech: float = tam_result["s_tech"]
+    indicators: Dict[str, Any] = tam_result.get("indicators") or {}
+    atr = float(indicators.get("atr") or 0.0)
+    adx = float(indicators.get("adx") or 0.0)
+    last_price = float(indicators.get("last_price") or 0.0)
+
+    if last_price <= 0:
+        logger.warning("last_price недоступен для %s — пропускаем", symbol)
+        return
+
+    # ── 6. FDS — Flat Detection System ───────────────────────────────────
+    if len(klines) >= 20:
+        closes_arr = np.array([float(k["close"]) for k in klines])
+        highs_arr = np.array([float(k["high"]) for k in klines])
+        lows_arr = np.array([float(k["low"]) for k in klines])
+        fds_result = detect_flat(closes_arr, highs_arr, lows_arr, adx, atr)
+        if fds_result["is_flat"]:
+            logger.info(
+                "FDS: флэт по %s — торговый сигнал пропускается (%s)",
+                symbol, fds_result["criteria"],
+            )
+            return
+
+    # ── 7. NPM — News Processing Module (FinBERT) ─────────────────────────
+    npm_result = await _get_npm().analyze(text)
+    s_news: float = npm_result["s_news"]
+
+    # ── 8. TSM — Time Series Module (LSTM) ───────────────────────────────
+    s_ts: float = await _get_tsm().predict(klines)
+
+    # ── 9. SGS — Signal Generation System ────────────────────────────────
+    decision = await sgs_aggregate(s_news, s_tech, s_ts, atr)
+    signal: str = decision["signal"]
 
     logger.info(
-        "Сигнал по тикеру %s: %s (score=%.3f)",
-        symbol,
-        signal,
-        decision["final_score"],
+        "SGS [%s]: signal=%s S_news=%.3f S_tech=%.3f S_ts=%.3f S_final=%.3f",
+        symbol, signal,
+        decision["s_news"], decision["s_tech"], decision["s_ts"], decision["s_final"],
     )
 
-    # 6. Торговое действие
-    if signal == "HOLD":
-        logger.info("Сигнал HOLD, ордера не отправляются")
+    if signal == "NEUTRAL":
+        logger.info("Сигнал NEUTRAL — ордера не отправляются")
         return
 
-    indicators: Dict[str, Any] = technical_data.get("indicators", {}) or {}
-    last_price_raw = indicators.get("last_price")
-    if last_price_raw is None:
-        logger.warning(
-            "Не удалось получить last_price для %s из технических индикаторов (%s), сделка пропускается",
-            symbol,
-            indicators,
-        )
-        return
-    last_price = float(last_price_raw)
-
+    # ── 10. Build order plan ──────────────────────────────────────────────
     tp_dist = float(decision.get("tp", 0.0))
     sl_dist = float(decision.get("sl", 0.0))
 
@@ -168,9 +207,10 @@ async def process_news_message(message: Message) -> None:
     tp_price = float(plan["tp_price"])
     sl_price = float(plan["sl_price"])
 
+    # ── 11. Execute order + TP/SL ─────────────────────────────────────────
     if signal == "LONG":
         order_resp = await orders.create_long(symbol=symbol, qty=qty, exchange=exchange)
-    else:  # signal == "SHORT"
+    else:
         order_resp = await orders.create_short(symbol=symbol, qty=qty, exchange=exchange)
 
     if order_resp.get("success") and tp_dist and sl_dist:
@@ -183,38 +223,31 @@ async def process_news_message(message: Message) -> None:
         )
     elif order_resp.get("success"):
         logger.warning(
-            "Позиция по %s открыта, но TP/SL НЕ установлены! (tp_dist=%.4f, sl_dist=%.4f). "
-            "Возможно, не удалось рассчитать ATR.",
-            symbol,
-            tp_dist,
-            sl_dist,
+            "Позиция %s открыта, но TP/SL не установлены (ATR=%.4f)", symbol, atr,
         )
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 async def run_bot() -> None:
-    """
-    Точка входа: запуск Pyrogram-клиента и прослушивание указанных каналов.
-    """
-    config = get_config()
+    cfg = get_config()
 
     logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+        level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    app = create_telegram_client(config)
-    setup_news_handler(app, config, process_news_message)
+    app = create_telegram_client(cfg)
+    setup_news_handler(app, cfg, process_news_message)
 
-    logger.info("Запуск Telegram клиента. Слушаем каналы: %s", config.TELEGRAM_CHANNEL_IDS)
+    logger.info("Запуск Telegram клиента. Слушаем каналы: %s", cfg.TELEGRAM_CHANNEL_IDS)
 
-    # Pyrogram сам управляет event loop внутри run()
     await app.start()
-    
-    # Запускаем мониторинг позиций в фоне
+
     monitor_task = asyncio.create_task(monitor_positions())
-    
     try:
-        # "Вечный" таск, чтобы клиент оставался запущенным
         await asyncio.Event().wait()
     finally:
         monitor_task.cancel()
@@ -231,5 +264,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
